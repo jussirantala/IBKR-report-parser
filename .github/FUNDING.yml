@@ -10,6 +10,6 @@ liberapay: # Replace with a single Liberapay username
 issuehunt: # Replace with a single IssueHunt username
 lfx_crowdfunding: # Replace with a single LFX Crowdfunding project-name e.g., cloud-foundry
 polar: # Replace with a single Polar username
-buy_me_a_coffee: # Replace with a single Buy Me a Coffee username
+buy_me_a_coffee: jussi
 thanks_dev: # Replace with a single thanks.dev username
 custom: https://btcpay595701.lndyn.com/api/v1/invoices?storeId=EYZrCUJZgQ6vGNWBGH4Vmtw4fnz9B7ssP5Xzg2GBjn48&currency=USD
