@@ -2,7 +2,7 @@
 
 Generates a graphical PnL dashboard from an Interactive Brokers trade export CSV.
 
-![PnL Report Example](pnl_report_2025.png)
+![PnL Report Example](example.png)
 
 ---
 
