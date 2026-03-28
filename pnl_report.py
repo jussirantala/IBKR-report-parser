@@ -172,6 +172,10 @@ with open(CSV_PATH, encoding="utf-8") as f:
             fifo = float(row["FifoPnlRealized"])
         except (ValueError, KeyError):
             fifo = 0.0
+        try:
+            fx_rate = float(row.get("FXRateToBase", 1) or 1)
+        except (ValueError, TypeError):
+            fx_rate = 1.0
 
         # ── FIFO pool: register opening trades from ALL years ─────────────
         # This way, positions opened before the chosen year have actual entry
@@ -207,11 +211,12 @@ with open(CSV_PATH, encoding="utf-8") as f:
         asset_monthly[asset][month] += fifo
         total_fifo                  += fifo
 
-        # ── Finnish tax: split gains vs losses per trade ────────────────────
-        if fifo > 0:
-            luovutusvoitot  += fifo
-        elif fifo < 0:
-            luovutustappiot += fifo
+        # ── Finnish tax: split gains vs losses per trade (in EUR) ───────────
+        fifo_eur = fifo * fx_rate
+        if fifo_eur > 0:
+            luovutusvoitot  += fifo_eur
+        elif fifo_eur < 0:
+            luovutustappiot += fifo_eur
 
         # ── Commission ──────────────────────────────────────────────────────
         try:
@@ -269,7 +274,7 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_buys_entry_actual  += matched_cost
                 adj_buys_entry_implied += implied_cost
 
-                luovutushinnat += close_value          # disposal price = sale proceeds
+                luovutushinnat += close_value * fx_rate  # disposal price in EUR
 
                 if matched_qty > 1e-9:
                     actual_entry_closes += 1
@@ -289,7 +294,7 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_sells_entry_actual  += matched_credit
                 adj_sells_entry_implied += implied_credit
 
-                luovutushinnat += total_entry           # disposal price = original short sale
+                luovutushinnat += total_entry * fx_rate   # disposal price in EUR
 
                 if matched_qty > 1e-9:
                     actual_entry_closes += 1
@@ -497,20 +502,20 @@ rows_data = [
      f"${adj_pnl_check:+,.2f}",
      f"{match_label(adj_diff)} vs FifoPnl (excl. BookTrade PnL: ${total_fifo - adj_pnl_check:+,.2f})"],
     ["", "", ""],
-    ["FINNISH TAX  /  VEROTUS  (before commission)",
-     "", "Based on FifoPnlRealized per closing trade"],
+    ["FINNISH TAX  /  VEROTUS  (EUR, before commission)",
+     "", "FifoPnlRealized × FXRateToBase per trade"],
     ["  Luovutushinnat yhteensä (Total disposal prices)",
-     f"${luovutushinnat:,.2f}",
-     "Sum of all sale/disposal proceeds"],
+     f"€{luovutushinnat:,.2f}",
+     "Sum of all sale/disposal proceeds in EUR"],
     ["  Luovutusvoitot yhteensä (Total capital gains)",
-     f"${luovutusvoitot:+,.2f}",
+     f"€{luovutusvoitot:+,.2f}",
      "Sum of trades with positive PnL"],
     ["  Luovutustappiot yhteensä (Total capital losses)",
-     f"${luovutustappiot:+,.2f}",
+     f"€{luovutustappiot:+,.2f}",
      "Sum of trades with negative PnL"],
     ["  Netto (Voitot − Tappiot)",
-     f"${luovutusvoitot + luovutustappiot:+,.2f}",
-     f"{match_label(luovutusvoitot + luovutustappiot - total_fifo)} vs Realized PnL"],
+     f"€{luovutusvoitot + luovutustappiot:+,.2f}",
+     ""],
 ]
 
 # Draw as a styled table
@@ -579,10 +584,10 @@ print(f"    entry from data  : ${adj_buys_entry_actual:,.2f}")
 print(f"    entry implied    : ${adj_buys_entry_implied:,.2f}")
 print(f"  Sells - Buys       : ${adj_pnl_check:+,.2f}  ({match_label(adj_diff)} vs FIFO)")
 print(f"  Matched closes: {actual_entry_closes}  |  Implied closes: {implied_entry_closes}")
-print(f"\nFINNISH TAX  /  VEROTUS  (before commission)")
-print(f"  Luovutushinnat yhteensä  (Total disposal prices) : ${luovutushinnat:,.2f}")
-print(f"  Luovutusvoitot yhteensä  (Total capital gains)   : ${luovutusvoitot:+,.2f}")
-print(f"  Luovutustappiot yhteensä (Total capital losses)  : ${luovutustappiot:+,.2f}")
-print(f"  Netto (Voitot − Tappiot)                         : ${luovutusvoitot + luovutustappiot:+,.2f}")
+print(f"\nFINNISH TAX  /  VEROTUS  (EUR, before commission)")
+print(f"  Luovutushinnat yhteensä  (Total disposal prices) : {luovutushinnat:.2f}")
+print(f"  Luovutusvoitot yhteensä  (Total capital gains)   : {luovutusvoitot:.2f}")
+print(f"  Luovutustappiot yhteensä (Total capital losses)  : {luovutustappiot:.2f}")
+print(f"  Netto (Voitot − Tappiot)                         : {luovutusvoitot + luovutustappiot:.2f}")
 
 plt.close(fig)
