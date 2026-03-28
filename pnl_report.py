@@ -192,7 +192,8 @@ with open(CSV_PATH, encoding="utf-8") as f:
         # This way, positions opened before the chosen year have actual entry
         # prices available when they close in the chosen year.
         if txn == "ExchTrade" and "O" in oci and qty > 0:
-            entry_comm_eur = abs(comm) * fx_rate
+            # For C;O (reversal) trades, commission belongs to the close side
+            entry_comm_eur = 0.0 if "C" in oci else abs(comm) * fx_rate
             if bs == "BUY":
                 open_pool[(symbol, "LONG")].append([qty, abs(proceeds), entry_comm_eur])
             elif bs == "SELL":

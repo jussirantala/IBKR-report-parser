@@ -2,3 +2,4 @@
 *.png
 !example.png
 .claude
+__pycache__
