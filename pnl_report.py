@@ -122,25 +122,32 @@ implied_entry_closes = 0
 
 def consume_pool(pool, needed_qty):
     """Consume up to needed_qty from the FIFO pool.
-    Returns (consumed_qty, consumed_proceeds)."""
+    Returns (consumed_qty, consumed_proceeds, consumed_entry_comm_eur)."""
     consumed_qty = 0.0
     consumed_proceeds = 0.0
+    consumed_comm_eur = 0.0
     while needed_qty > 1e-9 and pool:
         lot = pool[0]
+        lot_comm = lot[2] if len(lot) > 2 else 0.0
         take = min(needed_qty, lot[0])
         if take >= lot[0] - 1e-9:          # consume entire lot
             consumed_qty += lot[0]
             consumed_proceeds += lot[1]
+            consumed_comm_eur += lot_comm
             pool.popleft()
         else:                               # partial consumption
             frac = take / lot[0]
             partial = lot[1] * frac
+            partial_comm = lot_comm * frac
             consumed_qty += take
             consumed_proceeds += partial
+            consumed_comm_eur += partial_comm
             lot[0] -= take
             lot[1] -= partial
+            if len(lot) > 2:
+                lot[2] -= partial_comm
         needed_qty -= take
-    return consumed_qty, consumed_proceeds
+    return consumed_qty, consumed_proceeds, consumed_comm_eur
 
 with open(CSV_PATH, encoding="utf-8") as f:
     reader = csv.DictReader(f)
@@ -176,15 +183,20 @@ with open(CSV_PATH, encoding="utf-8") as f:
             fx_rate = float(row.get("FXRateToBase", 1) or 1)
         except (ValueError, TypeError):
             fx_rate = 1.0
+        try:
+            comm = float(row["IBCommission"])
+        except (ValueError, KeyError):
+            comm = 0.0
 
         # ── FIFO pool: register opening trades from ALL years ─────────────
         # This way, positions opened before the chosen year have actual entry
         # prices available when they close in the chosen year.
         if txn == "ExchTrade" and "O" in oci and qty > 0:
+            entry_comm_eur = abs(comm) * fx_rate
             if bs == "BUY":
-                open_pool[(symbol, "LONG")].append([qty, abs(proceeds)])
+                open_pool[(symbol, "LONG")].append([qty, abs(proceeds), entry_comm_eur])
             elif bs == "SELL":
-                open_pool[(symbol, "SHORT")].append([qty, proceeds])
+                open_pool[(symbol, "SHORT")].append([qty, proceeds, entry_comm_eur])
 
         # ── For non-chosen years: consume pool on closes to keep it accurate,
         #    but don't accumulate into any report accumulators ──────────────
@@ -210,19 +222,7 @@ with open(CSV_PATH, encoding="utf-8") as f:
         asset_pnl[asset]            += fifo
         asset_monthly[asset][month] += fifo
         total_fifo                  += fifo
-
-        # ── Finnish tax: split gains vs losses per trade (in EUR) ───────────
-        fifo_eur = fifo * fx_rate
-        if fifo_eur > 0:
-            luovutusvoitot  += fifo_eur
-        elif fifo_eur < 0:
-            luovutustappiot += fifo_eur
-
         # ── Commission ──────────────────────────────────────────────────────
-        try:
-            comm = float(row["IBCommission"])
-        except (ValueError, KeyError):
-            comm = 0.0
         total_commission        += comm
         asset_commission[asset] += comm
 
@@ -264,7 +264,7 @@ with open(CSV_PATH, encoding="utf-8") as f:
             if bs == "SELL":                        # closing a LONG position
                 total_entry = close_value - fifo
                 pool_key = (symbol, "LONG")
-                matched_qty, matched_cost = consume_pool(open_pool[pool_key], qty)
+                matched_qty, matched_cost, matched_entry_comm_eur = consume_pool(open_pool[pool_key], qty)
                 implied_cost = total_entry - matched_cost
 
                 adj_sells += close_value
@@ -274,7 +274,14 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_buys_entry_actual  += matched_cost
                 adj_buys_entry_implied += implied_cost
 
-                luovutushinnat += close_value * fx_rate  # disposal price in EUR
+                # Finnish tax (EUR, after commission)
+                exit_comm_eur = comm * fx_rate                          # negative
+                luovutushinnat += close_value * fx_rate + exit_comm_eur  # net disposal
+                trade_result_eur = fifo * fx_rate + exit_comm_eur - matched_entry_comm_eur
+                if trade_result_eur > 0:
+                    luovutusvoitot  += trade_result_eur
+                elif trade_result_eur < 0:
+                    luovutustappiot += trade_result_eur
 
                 if matched_qty > 1e-9:
                     actual_entry_closes += 1
@@ -284,7 +291,7 @@ with open(CSV_PATH, encoding="utf-8") as f:
             elif bs == "BUY":                       # closing a SHORT position
                 total_entry = close_value + fifo
                 pool_key = (symbol, "SHORT")
-                matched_qty, matched_credit = consume_pool(open_pool[pool_key], qty)
+                matched_qty, matched_credit, matched_entry_comm_eur = consume_pool(open_pool[pool_key], qty)
                 implied_credit = total_entry - matched_credit
 
                 adj_buys  += close_value
@@ -294,12 +301,27 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_sells_entry_actual  += matched_credit
                 adj_sells_entry_implied += implied_credit
 
-                luovutushinnat += total_entry * fx_rate   # disposal price in EUR
+                # Finnish tax (EUR, after commission)
+                exit_comm_eur = comm * fx_rate                                  # negative
+                luovutushinnat += total_entry * fx_rate - matched_entry_comm_eur # net disposal
+                trade_result_eur = fifo * fx_rate + exit_comm_eur - matched_entry_comm_eur
+                if trade_result_eur > 0:
+                    luovutusvoitot  += trade_result_eur
+                elif trade_result_eur < 0:
+                    luovutustappiot += trade_result_eur
 
                 if matched_qty > 1e-9:
                     actual_entry_closes += 1
                 if qty - matched_qty > 1e-9:
                     implied_entry_closes += 1
+
+        elif fifo != 0:
+            # Non-closing rows with realized PnL (e.g. non-standard txn types)
+            fifo_eur = fifo * fx_rate
+            if fifo_eur > 0:
+                luovutusvoitot  += fifo_eur
+            elif fifo_eur < 0:
+                luovutustappiot += fifo_eur
 
 gross_pnl_check = total_sells - total_buys
 adj_pnl_check   = adj_sells - adj_buys
@@ -502,17 +524,17 @@ rows_data = [
      f"${adj_pnl_check:+,.2f}",
      f"{match_label(adj_diff)} vs FifoPnl (excl. BookTrade PnL: ${total_fifo - adj_pnl_check:+,.2f})"],
     ["", "", ""],
-    ["FINNISH TAX  /  VEROTUS  (EUR, before commission)",
-     "", "FifoPnlRealized × FXRateToBase per trade"],
+    ["FINNISH TAX  /  VEROTUS  (EUR, after commission)",
+     "", "FifoPnlRealized + commissions, × FXRateToBase"],
     ["  Luovutushinnat yhteensä (Total disposal prices)",
      f"€{luovutushinnat:,.2f}",
-     "Sum of all sale/disposal proceeds in EUR"],
+     "Net disposal proceeds after exit commission (EUR)"],
     ["  Luovutusvoitot yhteensä (Total capital gains)",
      f"€{luovutusvoitot:+,.2f}",
-     "Sum of trades with positive PnL"],
+     "Positive trades after all matched commissions"],
     ["  Luovutustappiot yhteensä (Total capital losses)",
      f"€{luovutustappiot:+,.2f}",
-     "Sum of trades with negative PnL"],
+     "Negative trades after all matched commissions"],
     ["  Netto (Voitot − Tappiot)",
      f"€{luovutusvoitot + luovutustappiot:+,.2f}",
      ""],
@@ -584,7 +606,7 @@ print(f"    entry from data  : ${adj_buys_entry_actual:,.2f}")
 print(f"    entry implied    : ${adj_buys_entry_implied:,.2f}")
 print(f"  Sells - Buys       : ${adj_pnl_check:+,.2f}  ({match_label(adj_diff)} vs FIFO)")
 print(f"  Matched closes: {actual_entry_closes}  |  Implied closes: {implied_entry_closes}")
-print(f"\nFINNISH TAX  /  VEROTUS  (EUR, before commission)")
+print(f"\nFINNISH TAX  /  VEROTUS  (EUR, after commission)")
 print(f"  Luovutushinnat yhteensä  (Total disposal prices) : {f'{luovutushinnat:.2f}'.replace('.', ',')}")
 print(f"  Luovutusvoitot yhteensä  (Total capital gains)   : {f'{luovutusvoitot:.2f}'.replace('.', ',')}")
 print(f"  Luovutustappiot yhteensä (Total capital losses)  : {f'{luovutustappiot:.2f}'.replace('.', ',')}")
