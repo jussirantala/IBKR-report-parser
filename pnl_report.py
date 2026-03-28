@@ -97,6 +97,11 @@ asset_commission = defaultdict(float)
 asset_entry_comm = defaultdict(float)
 asset_exit_comm  = defaultdict(float)
 
+# ── Finnish tax (Verotus) ─────────────────────────────────────────────────────
+luovutushinnat  = 0.0   # Total disposal/sale prices
+luovutusvoitot  = 0.0   # Total capital gains  (positive PnL trades only)
+luovutustappiot = 0.0   # Total capital losses (negative PnL trades only)
+
 # ── FIFO pool for matching opening trades to closing trades ─────────────────
 # Key: (symbol, "LONG" | "SHORT")
 # Value: deque of [remaining_qty, remaining_proceeds]  (both positive)
@@ -202,6 +207,12 @@ with open(CSV_PATH, encoding="utf-8") as f:
         asset_monthly[asset][month] += fifo
         total_fifo                  += fifo
 
+        # ── Finnish tax: split gains vs losses per trade ────────────────────
+        if fifo > 0:
+            luovutusvoitot  += fifo
+        elif fifo < 0:
+            luovutustappiot += fifo
+
         # ── Commission ──────────────────────────────────────────────────────
         try:
             comm = float(row["IBCommission"])
@@ -258,6 +269,8 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_buys_entry_actual  += matched_cost
                 adj_buys_entry_implied += implied_cost
 
+                luovutushinnat += close_value          # disposal price = sale proceeds
+
                 if matched_qty > 1e-9:
                     actual_entry_closes += 1
                 if qty - matched_qty > 1e-9:
@@ -275,6 +288,8 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_buys_close_actual   += close_value
                 adj_sells_entry_actual  += matched_credit
                 adj_sells_entry_implied += implied_credit
+
+                luovutushinnat += total_entry           # disposal price = original short sale
 
                 if matched_qty > 1e-9:
                     actual_entry_closes += 1
@@ -481,11 +496,26 @@ rows_data = [
     ["  Adj. Sells - Buys",
      f"${adj_pnl_check:+,.2f}",
      f"{match_label(adj_diff)} vs FifoPnl (excl. BookTrade PnL: ${total_fifo - adj_pnl_check:+,.2f})"],
+    ["", "", ""],
+    ["FINNISH TAX  /  VEROTUS  (before commission)",
+     "", "Based on FifoPnlRealized per closing trade"],
+    ["  Luovutushinnat yhteensä (Total disposal prices)",
+     f"${luovutushinnat:,.2f}",
+     "Sum of all sale/disposal proceeds"],
+    ["  Luovutusvoitot yhteensä (Total capital gains)",
+     f"${luovutusvoitot:+,.2f}",
+     "Sum of trades with positive PnL"],
+    ["  Luovutustappiot yhteensä (Total capital losses)",
+     f"${luovutustappiot:+,.2f}",
+     "Sum of trades with negative PnL"],
+    ["  Netto (Voitot − Tappiot)",
+     f"${luovutusvoitot + luovutustappiot:+,.2f}",
+     f"{match_label(luovutusvoitot + luovutustappiot - total_fifo)} vs Realized PnL"],
 ]
 
 # Draw as a styled table
 col_x   = [0.01, 0.38, 0.58]
-row_h   = 0.055
+row_h   = 0.043
 y_start = 0.97
 
 for i, label in enumerate(col_labels):
@@ -497,7 +527,7 @@ for i, label in enumerate(col_labels):
 ax_sum.plot([0.01, 0.99], [y_start - 0.03, y_start - 0.03],
             color="#3a3a5a", linewidth=0.8, transform=ax_sum.transAxes)
 
-separator_rows = {6, 11}
+separator_rows = {6, 11, 16}
 for ri, row in enumerate(rows_data):
     y = y_start - 0.06 - ri * row_h
     if ri in separator_rows:
@@ -549,5 +579,10 @@ print(f"    entry from data  : ${adj_buys_entry_actual:,.2f}")
 print(f"    entry implied    : ${adj_buys_entry_implied:,.2f}")
 print(f"  Sells - Buys       : ${adj_pnl_check:+,.2f}  ({match_label(adj_diff)} vs FIFO)")
 print(f"  Matched closes: {actual_entry_closes}  |  Implied closes: {implied_entry_closes}")
+print(f"\nFINNISH TAX  /  VEROTUS  (before commission)")
+print(f"  Luovutushinnat yhteensä  (Total disposal prices) : ${luovutushinnat:,.2f}")
+print(f"  Luovutusvoitot yhteensä  (Total capital gains)   : ${luovutusvoitot:+,.2f}")
+print(f"  Luovutustappiot yhteensä (Total capital losses)  : ${luovutustappiot:+,.2f}")
+print(f"  Netto (Voitot − Tappiot)                         : ${luovutusvoitot + luovutustappiot:+,.2f}")
 
 plt.close(fig)
