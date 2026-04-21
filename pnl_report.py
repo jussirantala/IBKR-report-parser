@@ -9,6 +9,7 @@ Reads the multi-account CSV and produces:
 If the CSV contains trades from multiple years, the user is prompted to pick one.
 """
 
+import bisect
 import csv
 import glob
 import os
@@ -48,6 +49,7 @@ SKIP_TXN     = {"TransactionType", "TradeCancel", ""}
 years_found = set()
 base_currency = None
 fx_missing = False
+eur_rate_by_date = {}   # TradeDate (YYYY-MM-DD) → EUR→base FX rate, from EUR-denominated rows
 with open(CSV_PATH, encoding="utf-8") as f:
     reader = csv.DictReader(f)
     has_fx_col = reader.fieldnames is not None and "FXRateToBase" in reader.fieldnames
@@ -62,15 +64,20 @@ with open(CSV_PATH, encoding="utf-8") as f:
             continue
         years_found.add(td[:4])
 
-        # Detect base currency: the row whose FXRateToBase == 1.0 is itself in the base currency
-        if base_currency is None and has_fx_col and has_cur_col:
+        if has_fx_col and has_cur_col:
             try:
                 fx = float(row.get("FXRateToBase") or 0)
             except ValueError:
                 fx = 0.0
             cur = (row.get("CurrencyPrimary") or "").strip()
-            if cur and abs(fx - 1.0) < 1e-9:
+
+            # Detect base currency: the row whose FXRateToBase == 1.0 is itself in the base currency
+            if base_currency is None and cur and abs(fx - 1.0) < 1e-9:
                 base_currency = cur
+
+            # Collect EUR→base rate per trade date from EUR rows (needed to report Finnish tax in EUR when base ≠ EUR)
+            if cur == "EUR" and fx > 0 and td not in eur_rate_by_date:
+                eur_rate_by_date[td] = fx
 
 if fx_missing:
     print("Warning: CSV is missing CurrencyPrimary and/or FXRateToBase columns. "
@@ -81,6 +88,34 @@ elif base_currency is None:
     base_currency = "USD"
 else:
     print(f"Base currency detected: {base_currency}")
+
+# ── EUR rate lookup for Finnish tax (always reported in EUR) ────────────────
+eur_rate_dates  = sorted(eur_rate_by_date.keys())
+eur_rate_values = [eur_rate_by_date[d] for d in eur_rate_dates]
+
+def rate_eur_to_base(trade_date):
+    """EUR→base rate for a given TradeDate.
+    Uses exact match when available; otherwise the most recent prior date,
+    falling back to the earliest known date if the trade predates all EUR rows.
+    Returns None if no EUR rows exist in the data and base ≠ EUR."""
+    if base_currency == "EUR":
+        return 1.0
+    if not eur_rate_dates:
+        return None
+    if trade_date in eur_rate_by_date:
+        return eur_rate_by_date[trade_date]
+    idx = bisect.bisect_right(eur_rate_dates, trade_date)
+    if idx == 0:
+        return eur_rate_values[0]
+    return eur_rate_values[idx - 1]
+
+if base_currency != "EUR":
+    if not eur_rate_by_date:
+        print(f"Warning: base is {base_currency} and no EUR rows in CSV — "
+              f"Finnish tax figures will be reported in {base_currency}, not EUR.")
+    else:
+        print(f"Finnish tax: converting to EUR using {len(eur_rate_by_date)} "
+              f"per-date rates derived from EUR rows in the CSV.")
 
 years_sorted = sorted(years_found)
 
@@ -148,8 +183,9 @@ implied_entry_closes = 0
 
 def consume_pool(pool, needed_qty):
     """Consume up to needed_qty from the FIFO pool.
-    Returns (consumed_qty, consumed_proceeds, consumed_entry_comm)
-    — all monetary values are already in the account's base currency."""
+    Returns (consumed_qty, consumed_proceeds_base, consumed_entry_comm_eur)
+    — proceeds are in the account's base currency (for the adjusted buy/sell
+    check); entry commission is in EUR (for Finnish tax, which is always EUR)."""
     consumed_qty = 0.0
     consumed_proceeds = 0.0
     consumed_comm = 0.0
@@ -194,38 +230,56 @@ with open(CSV_PATH, encoding="utf-8") as f:
         symbol = row.get("Symbol", "")
         bs     = row.get("Buy/Sell", "")
         oci    = row.get("Open/CloseIndicator", "")
+        cur    = (row.get("CurrencyPrimary") or "").strip()
         # FX rate to the account's base currency — applied to every monetary field below
         try:
             fx_rate = float(row.get("FXRateToBase", 1) or 1)
         except (ValueError, TypeError):
             fx_rate = 1.0
+        # Separate FX rate to EUR — used for Finnish tax, which must be reported in EUR.
+        # When base is EUR this collapses to fx_rate; when base ≠ EUR we derive it from
+        # per-date EUR rates sampled elsewhere in the CSV. If no EUR data is available,
+        # fall back to base-currency conversion (matches pre-refactor behaviour).
+        if cur == "EUR":
+            fx_to_eur = 1.0
+        else:
+            eur_rate = rate_eur_to_base(trade_date)
+            fx_to_eur = (fx_rate / eur_rate) if eur_rate else fx_rate
         try:
-            proceeds = float(row["Proceeds"]) * fx_rate
+            proceeds_raw = float(row["Proceeds"])
         except (ValueError, KeyError):
-            proceeds = 0.0
+            proceeds_raw = 0.0
+        proceeds     = proceeds_raw * fx_rate
+        proceeds_eur = proceeds_raw * fx_to_eur
         try:
             qty = abs(float(row["Quantity"]))
         except (ValueError, KeyError):
             qty = 0.0
         try:
-            fifo = float(row["FifoPnlRealized"]) * fx_rate
+            fifo_raw = float(row["FifoPnlRealized"])
         except (ValueError, KeyError):
-            fifo = 0.0
+            fifo_raw = 0.0
+        fifo     = fifo_raw * fx_rate
+        fifo_eur = fifo_raw * fx_to_eur
         try:
-            comm = float(row["IBCommission"]) * fx_rate
+            comm_raw = float(row["IBCommission"])
         except (ValueError, KeyError):
-            comm = 0.0
+            comm_raw = 0.0
+        comm     = comm_raw * fx_rate
+        comm_eur = comm_raw * fx_to_eur
 
         # ── FIFO pool: register opening trades from ALL years ─────────────
         # This way, positions opened before the chosen year have actual entry
         # prices available when they close in the chosen year.
+        # Pool entries store proceeds in base currency (for the adjusted sell/buy
+        # check) and entry commission in EUR (for Finnish tax).
         if txn == "ExchTrade" and "O" in oci and qty > 0:
             # For C;O (reversal) trades, commission belongs to the close side
-            entry_comm_base = 0.0 if "C" in oci else abs(comm)
+            entry_comm_eur = 0.0 if "C" in oci else abs(comm_eur)
             if bs == "BUY":
-                open_pool[(symbol, "LONG")].append([qty, abs(proceeds), entry_comm_base])
+                open_pool[(symbol, "LONG")].append([qty, abs(proceeds), entry_comm_eur])
             elif bs == "SELL":
-                open_pool[(symbol, "SHORT")].append([qty, proceeds, entry_comm_base])
+                open_pool[(symbol, "SHORT")].append([qty, proceeds, entry_comm_eur])
 
         # ── For non-chosen years: consume pool on closes to keep it accurate,
         #    but don't accumulate into any report accumulators ──────────────
@@ -280,20 +334,22 @@ with open(CSV_PATH, encoding="utf-8") as f:
         is_close = "C" in oci and qty > 0 and txn in ("ExchTrade", "BookTrade")
         if is_close:
             if txn == "ExchTrade":
-                close_value = abs(proceeds)
+                close_value     = abs(proceeds)
+                close_value_eur = abs(proceeds_eur)
             else:
                 try:
-                    close_price = float(row.get("ClosePrice") or 0) * fx_rate
-                    multiplier  = float(row.get("Multiplier") or 1)
+                    close_price_raw = float(row.get("ClosePrice") or 0)
+                    multiplier      = float(row.get("Multiplier") or 1)
                 except (ValueError, TypeError):
-                    close_price = 0.0
-                    multiplier  = 1.0
-                close_value = close_price * multiplier * qty
+                    close_price_raw = 0.0
+                    multiplier      = 1.0
+                close_value     = close_price_raw * fx_rate   * multiplier * qty
+                close_value_eur = close_price_raw * fx_to_eur * multiplier * qty
 
             if bs == "SELL":                        # closing a LONG position
                 total_entry = close_value - fifo
                 pool_key = (symbol, "LONG")
-                matched_qty, matched_cost, matched_entry_comm_base = consume_pool(open_pool[pool_key], qty)
+                matched_qty, matched_cost, matched_entry_comm_eur = consume_pool(open_pool[pool_key], qty)
                 implied_cost = total_entry - matched_cost
 
                 adj_sells += close_value
@@ -303,10 +359,15 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_buys_entry_actual  += matched_cost
                 adj_buys_entry_implied += implied_cost
 
-                # Finnish tax (in base currency; meaningful when base is EUR)
-                exit_comm_base = comm                                              # negative
-                luovutushinnat += close_value + exit_comm_base                     # net disposal
-                trade_result = fifo + exit_comm_base - matched_entry_comm_base
+                # Finnish tax — always in EUR.
+                # FifoPnlRealized is already net of BOTH entry and exit
+                # commissions (per IBKR Flex Statement docs: "For the purpose
+                # of cost basis and realized profit or loss, commissions are
+                # netted"), so trade_result is simply fifo_eur — subtracting
+                # commissions again would double-count them.
+                exit_comm_eur = comm_eur                                            # negative
+                luovutushinnat += close_value_eur + exit_comm_eur                   # net disposal (sell proceeds − sell commission)
+                trade_result = fifo_eur
                 if trade_result > 0:
                     luovutusvoitot  += trade_result
                 elif trade_result < 0:
@@ -318,9 +379,10 @@ with open(CSV_PATH, encoding="utf-8") as f:
                     implied_entry_closes += 1
 
             elif bs == "BUY":                       # closing a SHORT position
-                total_entry = close_value + fifo
+                total_entry     = close_value     + fifo
+                total_entry_eur = close_value_eur + fifo_eur
                 pool_key = (symbol, "SHORT")
-                matched_qty, matched_credit, matched_entry_comm_base = consume_pool(open_pool[pool_key], qty)
+                matched_qty, matched_credit, matched_entry_comm_eur = consume_pool(open_pool[pool_key], qty)
                 implied_credit = total_entry - matched_credit
 
                 adj_buys  += close_value
@@ -330,10 +392,20 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 adj_sells_entry_actual  += matched_credit
                 adj_sells_entry_implied += implied_credit
 
-                # Finnish tax (in base currency; meaningful when base is EUR)
-                exit_comm_base = comm                                              # negative
-                luovutushinnat += total_entry - matched_entry_comm_base            # net disposal
-                trade_result = fifo + exit_comm_base - matched_entry_comm_base
+                # Finnish tax — always in EUR.
+                # For a short position, the "disposal" is the opening SELL;
+                # net luovutushinta = short-sell proceeds − short-sell
+                # commission. total_entry_eur = close_value_eur + fifo_eur
+                # and, since fifo is already net of both commissions, equals
+                #   short_sell_proceeds − |entry_comm| − |exit_comm|
+                # (all in EUR at the closing row's FX). Subtracting
+                # exit_comm_eur (negative) adds |exit_comm| back, giving
+                # short_sell_proceeds − |entry_comm|. trade_result is just
+                # fifo_eur for the same double-counting reason as the LONG
+                # branch above.
+                exit_comm_eur = comm_eur                                            # negative
+                luovutushinnat += total_entry_eur - exit_comm_eur                   # net disposal (short-sell proceeds − entry commission)
+                trade_result = fifo_eur
                 if trade_result > 0:
                     luovutusvoitot  += trade_result
                 elif trade_result < 0:
@@ -344,12 +416,12 @@ with open(CSV_PATH, encoding="utf-8") as f:
                 if qty - matched_qty > 1e-9:
                     implied_entry_closes += 1
 
-        elif fifo != 0:
+        elif fifo_eur != 0:
             # Non-closing rows with realized PnL (e.g. non-standard txn types)
-            if fifo > 0:
-                luovutusvoitot  += fifo
-            elif fifo < 0:
-                luovutustappiot += fifo
+            if fifo_eur > 0:
+                luovutusvoitot  += fifo_eur
+            elif fifo_eur < 0:
+                luovutustappiot += fifo_eur
 
 gross_pnl_check = total_sells - total_buys
 adj_pnl_check   = adj_sells - adj_buys
@@ -503,13 +575,14 @@ adj_diff = adj_pnl_check - total_fifo
 def match_label(d):
     return "MATCH" if abs(d) < 0.10 else f"off by {d:+,.2f} {base_currency}"
 
-net_pnl_after_comm = total_fifo + total_commission
+# FifoPnlRealized is net of commissions. Back them out to show the pre-commission figure.
+gross_pnl_before_comm = total_fifo - total_commission
 
 col_labels = ["Metric", "Value", "Note"]
 rows_data = [
     ["Realized PnL  (FifoPnlRealized)",
      f"{total_fifo:+,.2f} {base_currency}",
-     "IBKR FIFO on closing trades (before commission)"],
+     "IBKR FIFO on closing trades (already net of commissions)"],
     ["   STK  pnl / comm (entry/exit)",
      f"{asset_pnl.get('STK',0):+,.2f}  /  {asset_commission.get('STK',0):,.2f}"
      f"  ({asset_entry_comm.get('STK',0):,.2f} / {asset_exit_comm.get('STK',0):,.2f}) {base_currency}", ""],
@@ -522,9 +595,9 @@ rows_data = [
     ["Total Commission  (entry / exit)",
      f"{total_commission:,.2f}  ({entry_commission:,.2f} / {exit_commission:,.2f}) {base_currency}",
      "Negative = cost"],
-    ["Net PnL after commission",
-     f"{net_pnl_after_comm:+,.2f} {base_currency}",
-     "FifoPnlRealized + IBCommission"],
+    ["Gross PnL  (before commission)",
+     f"{gross_pnl_before_comm:+,.2f} {base_currency}",
+     "FifoPnlRealized with commissions added back"],
     ["", "", ""],
     ["RAW check  (actual Proceeds in the data, ExchTrade only)",
      "", ""],
@@ -534,7 +607,7 @@ rows_data = [
      f"{total_buys:,.2f} {base_currency}", ""],
     ["  Sells - Buys",
      f"{gross_pnl_check:+,.2f} {base_currency}",
-     f"off by {raw_diff:+,.2f} {base_currency} vs FifoPnl  (open positions at period boundaries)"],
+     f"off by {raw_diff:+,.2f} {base_currency} vs FifoPnl  (FifoPnl is net of commissions + open positions at period boundaries)"],
     ["", "", ""],
     ["ADJUSTED check  (actual entry when in data, implied otherwise)",
      "", f"{actual_entry_closes} closes matched, {implied_entry_closes} implied"],
@@ -554,12 +627,14 @@ rows_data = [
     ["", "", ""],
     ["FINNISH TAX  /  VEROTUS  (EUR, after commission)",
      "",
-     "FifoPnlRealized + commissions, converted via FXRateToBase"
+     "FifoPnlRealized (already net of commissions per IBKR) converted via FXRateToBase"
      if base_currency == "EUR"
-     else f"WARNING: base is {base_currency}, not EUR — figures are wrong"],
+     else (f"Converted to EUR via {len(eur_rate_by_date)} per-date rates from EUR rows in CSV"
+           if eur_rate_by_date
+           else f"WARNING: base is {base_currency} and no EUR rows in CSV — figures are in {base_currency}")],
     ["  Luovutushinnat yhteensä (Total disposal prices)",
      f"{luovutushinnat:,.2f} EUR",
-     "Net disposal proceeds after exit commission"],
+     "Net disposal proceeds after sale-side commission"],
     ["  Luovutusvoitot yhteensä (Total capital gains)",
      f"{luovutusvoitot:+,.2f} EUR",
      "Positive trades after all matched commissions"],
@@ -623,7 +698,7 @@ print(f"\nReport saved: {out_path}")
 print(f"\nAll figures below are in base currency: {base_currency}")
 print(f"FIFO Realized PnL      : {total_fifo:+,.2f}")
 print(f"Total Commission       : {total_commission:,.2f}  (entry: {entry_commission:,.2f}  exit: {exit_commission:,.2f})")
-print(f"Net PnL after comm     : {net_pnl_after_comm:+,.2f}")
+print(f"Gross PnL (before comm): {gross_pnl_before_comm:+,.2f}")
 print(f"\nRAW  (ExchTrade actual proceeds in the data)")
 print(f"  Total Sells        : {total_sells:,.2f}")
 print(f"  Total Buys         : {total_buys:,.2f}")
@@ -639,9 +714,9 @@ print(f"    entry from data  : {adj_buys_entry_actual:,.2f}")
 print(f"    entry implied    : {adj_buys_entry_implied:,.2f}")
 print(f"  Sells - Buys       : {adj_pnl_check:+,.2f}  ({match_label(adj_diff)} vs FIFO)")
 print(f"  Matched closes: {actual_entry_closes}  |  Implied closes: {implied_entry_closes}")
-if base_currency != "EUR":
-    print(f"\nWARNING: base currency is {base_currency}, not EUR — "
-          f"Finnish tax figures below are NOT in EUR and should not be used for Finnish tax reporting.")
+if base_currency != "EUR" and not eur_rate_by_date:
+    print(f"\nWARNING: base currency is {base_currency} and no EUR rows were found in the CSV — "
+          f"Finnish tax figures below are NOT in EUR (reported in {base_currency} instead).")
 print(f"\nFINNISH TAX  /  VEROTUS  (EUR, after commission)")
 print(f"  Luovutushinnat yhteensä  (Total disposal prices) : {f'{luovutushinnat:.2f}'.replace('.', ',')}")
 print(f"  Luovutusvoitot yhteensä  (Total capital gains)   : {f'{luovutusvoitot:.2f}'.replace('.', ',')}")
