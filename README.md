@@ -42,6 +42,8 @@ and create a new **Trades** query. Include at least these columns:
 | `Quantity` | Yes |
 | `ClosePrice` | Yes |
 | `Multiplier` | Yes |
+| `CurrencyPrimary` | Yes |
+| `FXRateToBase` | Yes |
 
 Export settings: **CSV format**, date format **yyyy-MM-dd**, include header row.
 
